@@ -3,10 +3,13 @@ package main
 import (
 	"bytes"
 	"compress/zlib"
+	"crypto/sha1"
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
+	"strconv"
 )
 
 // Usage: your_program.sh <command> <arg1> <arg2> ...
@@ -33,23 +36,52 @@ func main() {
 
 		fmt.Println("Initialized git directory")
 	case "cat-file":
-		object_path, flag, err := getObjectPathAndFlag(os.Args[2:])
+		objectPath, flag, err := parseCatFile(os.Args[2:])
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error while getting object path: ", err)
+			fmt.Fprintf(os.Stderr, "Error while getting object path: %s\n", err)
 			os.Exit(1)
 		}
 
-		object_bytes, err := getUncompressedObject(object_path)
+		object_bytes, err := getUncompressedObject(objectPath)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error while decompressing object: ", err)
+			fmt.Fprintf(os.Stderr, "Error while decompressing object: %s\n", err)
 			os.Exit(1)
 		}
 
-		err = readObjectData(object_bytes, flag)
+		err = printObjectData(object_bytes, flag)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error while reading object: ", err)
+			fmt.Fprintf(os.Stderr, "Error while reading object: %s\n", err)
 			os.Exit(1)
 		}
+	case "hash-object":
+		objectPath, flag, err := parseHashObject(os.Args[2:])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error while parssing args: %s\n", err)
+			os.Exit(1)
+		}
+		objectContent, objectSize, err := readObjectContent(objectPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error while reading object: %s\n", err)
+			os.Exit(1)
+		}
+		compressedObject, err := generateObject("blob", objectSize, objectContent)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error while generating object: %s\n", err)
+			os.Exit(1)
+		}
+		hasher := sha1.New()
+		hasher.Write(compressedObject)
+		hash := hasher.Sum(nil)
+
+		switch flag {
+		case "-w":
+			err := writeObject(hash, compressedObject)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error while writting the object: %s\n", err)
+				os.Exit(1)
+			}
+		}
+		fmt.Printf("%x\n", hash)
 
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command %s\n", command)
@@ -57,11 +89,11 @@ func main() {
 	}
 }
 
-func getObjectPathAndFlag(args []string) (string, string, error) {
+func parseCatFile(args []string) (string, string, error) {
 	// all objects are inside .git/objects directory
 	// we'll use first two characters of objectName to find directory of object
 	if len(args) != 2 {
-		return "", "", fmt.Errorf("use: git-cat <flag> <object_name>")
+		return "", "", fmt.Errorf("use: git cat-file <flag> <object_name>")
 	}
 
 	objectFlag, objectName := args[0], args[1]
@@ -79,6 +111,30 @@ func getObjectPathAndFlag(args []string) (string, string, error) {
 	}
 
 	return objectPath, objectFlag, nil
+}
+
+func parseHashObject(args []string) (string, string, error) {
+	if len(args) != 1 && len(args) != 2 {
+		return "", "", fmt.Errorf("use: git hash-object <flag> <object_path>")
+	}
+
+	var flag string
+	var path string
+	if len(args) == 2 {
+		flag = args[0]
+		path = args[1]
+	} else if len(args) == 1 {
+		flag = ""
+		path = args[0]
+	}
+
+	// check path
+
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return "", "", fmt.Errorf("object on %s path not found", path)
+	}
+
+	return path, flag, nil
 }
 
 func getUncompressedObject(objectPath string) ([]byte, error) {
@@ -101,7 +157,7 @@ func getUncompressedObject(objectPath string) ([]byte, error) {
 	return decompressed, nil
 }
 
-func readObjectData(objectBytes []byte, flag string) error {
+func printObjectData(objectBytes []byte, flag string) error {
 	nullIndex := bytes.IndexByte(objectBytes, 0)
 	if nullIndex == -1 {
 		return fmt.Errorf("invalid object format: no null byte")
@@ -130,6 +186,54 @@ func readObjectData(objectBytes []byte, flag string) error {
 	case "-p":
 		// Print content of the object
 		fmt.Printf(string(content))
+	}
+
+	return nil
+}
+
+func readObjectContent(path string) ([]byte, int, error) {
+	fileData, err := os.ReadFile(path)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return fileData, len(fileData), nil
+}
+
+func generateObject(objectType string, objectSize int, objectContent []byte) ([]byte, error) {
+	header := objectType + " " + strconv.Itoa(objectSize)
+	headerNull := append([]byte(header), byte(0))
+	objectBytes := append(headerNull, objectContent...)
+
+	var b bytes.Buffer
+	zw := zlib.NewWriter(&b)
+
+	_, err := zw.Write(objectBytes)
+	if err != nil {
+		return nil, fmt.Errorf("Error while compressing the object")
+	}
+
+	if err := zw.Close(); err != nil {
+		return nil, fmt.Errorf("Error while closing writter")
+	}
+
+	return b.Bytes(), nil
+}
+
+func writeObject(hash, object []byte) error {
+	hashString := fmt.Sprintf("%x", hash)
+
+	dirName := hashString[:2]
+	fileName := hashString[2:]
+
+	dirPath := path.Join(".git/objects", dirName)
+	if err := os.MkdirAll(dirPath, 0755); err != nil {
+		return fmt.Errorf("failed to create directory: %v", err)
+	}
+
+	fullPath := path.Join(dirPath, fileName)
+	if err := os.WriteFile(fullPath, object, 0644); err != nil {
+		return fmt.Errorf("failed to write object file: %v", err)
 	}
 
 	return nil

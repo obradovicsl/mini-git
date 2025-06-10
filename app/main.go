@@ -64,14 +64,16 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error while reading object: %s\n", err)
 			os.Exit(1)
 		}
-		compressedObject, err := generateObject("blob", objectSize, objectContent)
+		objectBytes := generateObject("blob", objectSize, objectContent)
+		hasher := sha1.New()
+		hasher.Write(objectBytes)
+		hash := hasher.Sum(nil)
+
+		compressedObject, err := compressObject(objectBytes)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error while generating object: %s\n", err)
+			fmt.Fprintf(os.Stderr, "Error while compresing object: %s\n", err)
 			os.Exit(1)
 		}
-		hasher := sha1.New()
-		hasher.Write(compressedObject)
-		hash := hasher.Sum(nil)
 
 		switch flag {
 		case "-w":
@@ -200,15 +202,17 @@ func readObjectContent(path string) ([]byte, int, error) {
 	return fileData, len(fileData), nil
 }
 
-func generateObject(objectType string, objectSize int, objectContent []byte) ([]byte, error) {
+func generateObject(objectType string, objectSize int, objectContent []byte) []byte {
 	header := objectType + " " + strconv.Itoa(objectSize)
 	headerNull := append([]byte(header), byte(0))
-	objectBytes := append(headerNull, objectContent...)
+	return append(headerNull, objectContent...)
+}
 
+func compressObject(object []byte) ([]byte, error) {
 	var b bytes.Buffer
 	zw := zlib.NewWriter(&b)
 
-	_, err := zw.Write(objectBytes)
+	_, err := zw.Write(object)
 	if err != nil {
 		return nil, fmt.Errorf("Error while compressing the object")
 	}

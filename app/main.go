@@ -42,7 +42,7 @@ func main() {
 			os.Exit(1)
 		}
 
-		object_bytes, err := getUncompressedObject(objectPath)
+		object_bytes, err := decompressObject(objectPath)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error while decompressing object: %s\n", err)
 			os.Exit(1)
@@ -65,6 +65,7 @@ func main() {
 			os.Exit(1)
 		}
 		objectBytes := generateObject("blob", objectSize, objectContent)
+
 		hasher := sha1.New()
 		hasher.Write(objectBytes)
 		hash := hasher.Sum(nil)
@@ -84,6 +85,25 @@ func main() {
 			}
 		}
 		fmt.Printf("%x\n", hash)
+
+	case "ls-tree":
+		treePath, flag, err := parseLsTree(os.Args[2:])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error while getting tree path: %s\n", err)
+			os.Exit(1)
+		}
+
+		treeBytes, err := decompressObject(treePath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error while decompressing tree: %s\n", err)
+			os.Exit(1)
+		}
+
+		err = printTreeData(treeBytes, flag)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error while reading tree: %s\n", err)
+			os.Exit(1)
+		}
 
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command %s\n", command)
@@ -139,7 +159,33 @@ func parseHashObject(args []string) (string, string, error) {
 	return path, flag, nil
 }
 
-func getUncompressedObject(objectPath string) ([]byte, error) {
+func parseLsTree(args []string) (string, string, error) {
+	if len(args) != 1 && len(args) != 2 {
+		return "", "", fmt.Errorf("use: git ls-tree <flag> <tree_path>")
+	}
+
+	var flag string
+	var treeSHA string
+	if len(args) == 2 {
+		flag = args[0]
+		treeSHA = args[1]
+	} else if len(args) == 1 {
+		flag = ""
+		treeSHA = args[0]
+	}
+
+	dir := treeSHA[:2]
+	file := treeSHA[2:]
+	treePath := filepath.Join(".git", "objects", dir, file)
+
+	if _, err := os.Stat(treePath); os.IsNotExist(err) {
+		return "", "", fmt.Errorf("tree on %s path not found", treePath)
+	}
+
+	return treePath, flag, nil
+}
+
+func decompressObject(objectPath string) ([]byte, error) {
 	data, err := os.ReadFile(objectPath)
 	if err != nil {
 		return nil, err
@@ -188,6 +234,44 @@ func printObjectData(objectBytes []byte, flag string) error {
 	case "-p":
 		// Print content of the object
 		fmt.Printf(string(content))
+	}
+
+	return nil
+}
+
+func printTreeData(objectBytes []byte, flag string) error {
+	nullIndex := bytes.IndexByte(objectBytes, 0)
+	if nullIndex == -1 {
+		return fmt.Errorf("invalid tree format: no null byte")
+	}
+
+	content := objectBytes[nullIndex+1:] // <content>
+	i := 0
+	for i < len(content) {
+		nullIndex := bytes.IndexByte(content[i:], 0)
+		if nullIndex == -1 {
+			return fmt.Errorf("malformed tree entry")
+		}
+
+		entryHeader := content[i : i+nullIndex]
+		parts := bytes.SplitN(entryHeader, []byte(" "), 2)
+		mode := string(parts[0])
+		name := string(parts[1])
+
+		i += nullIndex + 1
+		if i+20 > len(content) {
+			return fmt.Errorf("unexpected end of SHA")
+		}
+
+		shaBytes := content[i : i+20]
+		shaHex := fmt.Sprintf("%x", shaBytes)
+		i += 20
+
+		if flag == "--name-only" {
+			fmt.Println(name)
+		} else {
+			fmt.Printf("%s %s %s\n", mode, shaHex, name)
+		}
 	}
 
 	return nil

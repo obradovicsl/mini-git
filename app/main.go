@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type IndexEntry struct {
@@ -123,6 +124,8 @@ func main() {
 	case "write-tree":
 		// Load entries from .git/index
 
+		// JUST FOR CODECRAFTERS TESTS
+		///////////////////////////////////////////////////////
 		cmd := exec.Command("git", "add", ".")
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
@@ -132,6 +135,7 @@ func main() {
 		if err != nil {
 			panic(err)
 		}
+		///////////////////////////////////////////////////////
 
 		indexEntries, err := readGitIndex()
 		if err != nil {
@@ -152,6 +156,29 @@ func main() {
 
 		// Print root dir hash
 		fmt.Printf("%x\n", directoryRoot.Hash)
+	case "commit-tree":
+		treeHash, commitMessage, parentHash, err := parseCommitTree(os.Args[2:])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error while parssing args: %s\n", err)
+			os.Exit(1)
+		}
+
+		commitContent := createCommitContent(treeHash, commitMessage, parentHash)
+		objectBytes := generateObject("commit", len(commitContent), commitContent)
+		hash := hashObject(objectBytes)
+
+		compressedObject, err := compressObject(objectBytes)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error while compresing commit: %s\n", err)
+			os.Exit(1)
+		}
+
+		err = writeObject(hash, compressedObject)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error while writting the commit: %s\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("%x\n", hash)
 
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command %s\n", command)
@@ -231,6 +258,27 @@ func parseLsTree(args []string) (string, string, error) {
 	}
 
 	return treePath, flag, nil
+}
+
+func parseCommitTree(args []string) (string, string, string, error) {
+	if len(args) != 3 && len(args) != 5 {
+		return "", "", "", fmt.Errorf("use: git commit-tree <HASH> -p <HASH> -m <message>")
+	}
+
+	var message string
+	var treeSHA string
+	var parentSHA string
+	if len(args) == 3 {
+		treeSHA = args[0]
+		message = args[2]
+		parentSHA = ""
+	} else if len(args) == 5 {
+		treeSHA = args[0]
+		parentSHA = args[2]
+		message = args[4]
+	}
+
+	return treeSHA, message, parentSHA, nil
 }
 
 func decompressObject(objectPath string) ([]byte, error) {
@@ -574,4 +622,26 @@ func createTreeContent(children map[string]*TreeNode) []byte {
 	}
 
 	return content
+}
+
+func createCommitContent(treeHash, commitMessage, parentHash string) []byte {
+	authorName := "obradovicsl"
+	authorEmail := "slobodanobradovic3@gmail.com"
+	now := time.Now()
+	timestamp := now.Unix()
+	timezoneOffset := now.Format("-0700") // Git-style timezone
+
+	content := ""
+	content += fmt.Sprintf("tree %s\n", treeHash)
+	if parentHash != "" {
+		content += fmt.Sprintf("parent %s\n", parentHash)
+	}
+
+	content += fmt.Sprintf("author %s <%s> %d %s\n", authorName, authorEmail, timestamp, timezoneOffset)
+	content += fmt.Sprintf("committer %s <%s> %d %s\n", authorName, authorEmail, timestamp, timezoneOffset)
+	content += "\n"
+	content += commitMessage
+	content += "\n"
+
+	return []byte(content)
 }

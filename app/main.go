@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"sort"
@@ -121,6 +122,17 @@ func main() {
 		}
 	case "write-tree":
 		// Load entries from .git/index
+
+		cmd := exec.Command("git", "add", ".")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Stdin = os.Stdin // ako treba interakcija
+
+		err := cmd.Run()
+		if err != nil {
+			panic(err)
+		}
+
 		indexEntries, err := readGitIndex()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error while reading .git/index: %s\n", err)

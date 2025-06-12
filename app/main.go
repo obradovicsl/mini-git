@@ -4,13 +4,30 @@ import (
 	"bytes"
 	"compress/zlib"
 	"crypto/sha1"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strconv"
+	"strings"
 )
+
+type IndexEntry struct {
+	Path string
+	Hash []byte
+	Mode uint32
+}
+
+type TreeNode struct {
+	Name     string
+	IsDir    bool
+	Hash     []byte
+	Mode     uint32
+	Children map[string]*TreeNode
+}
 
 // Usage: your_program.sh <command> <arg1> <arg2> ...
 func main() {
@@ -64,11 +81,9 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error while reading object: %s\n", err)
 			os.Exit(1)
 		}
-		objectBytes := generateObject("blob", objectSize, objectContent)
 
-		hasher := sha1.New()
-		hasher.Write(objectBytes)
-		hash := hasher.Sum(nil)
+		objectBytes := generateObject("blob", objectSize, objectContent)
+		hash := hashObject(objectBytes)
 
 		compressedObject, err := compressObject(objectBytes)
 		if err != nil {
@@ -104,6 +119,27 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error while reading tree: %s\n", err)
 			os.Exit(1)
 		}
+	case "write-tree":
+		// Load entries from .git/index
+		indexEntries, err := readGitIndex()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error while reading .git/index: %s\n", err)
+			os.Exit(1)
+		}
+
+		// Make a tree struct out of these index entries
+		directoryRoot := makeDirTree(indexEntries)
+
+		// Create directories from dirRoot
+		err = createObjects(directoryRoot)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error while generating string objects: %s\n", err)
+			os.Exit(1)
+		}
+		// printTree(directoryRoot)
+
+		// Print root dir hash
+		fmt.Printf("%x\n", directoryRoot.Hash)
 
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command %s\n", command)
@@ -205,6 +241,29 @@ func decompressObject(objectPath string) ([]byte, error) {
 	return decompressed, nil
 }
 
+func compressObject(object []byte) ([]byte, error) {
+	var b bytes.Buffer
+	zw := zlib.NewWriter(&b)
+
+	_, err := zw.Write(object)
+	if err != nil {
+		return nil, fmt.Errorf("Error while compressing the object")
+	}
+
+	if err := zw.Close(); err != nil {
+		return nil, fmt.Errorf("Error while closing writter")
+	}
+
+	return b.Bytes(), nil
+}
+
+func hashObject(objectBytes []byte) []byte {
+	hasher := sha1.New()
+	hasher.Write(objectBytes)
+	hash := hasher.Sum(nil)
+	return hash
+}
+
 func printObjectData(objectBytes []byte, flag string) error {
 	nullIndex := bytes.IndexByte(objectBytes, 0)
 	if nullIndex == -1 {
@@ -292,22 +351,6 @@ func generateObject(objectType string, objectSize int, objectContent []byte) []b
 	return append(headerNull, objectContent...)
 }
 
-func compressObject(object []byte) ([]byte, error) {
-	var b bytes.Buffer
-	zw := zlib.NewWriter(&b)
-
-	_, err := zw.Write(object)
-	if err != nil {
-		return nil, fmt.Errorf("Error while compressing the object")
-	}
-
-	if err := zw.Close(); err != nil {
-		return nil, fmt.Errorf("Error while closing writter")
-	}
-
-	return b.Bytes(), nil
-}
-
 func writeObject(hash, object []byte) error {
 	hashString := fmt.Sprintf("%x", hash)
 
@@ -320,9 +363,203 @@ func writeObject(hash, object []byte) error {
 	}
 
 	fullPath := path.Join(dirPath, fileName)
+
+	if _, err := os.Stat(fullPath); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("error checking object file: %v", err)
+	}
+
 	if err := os.WriteFile(fullPath, object, 0644); err != nil {
 		return fmt.Errorf("failed to write object file: %v", err)
 	}
 
 	return nil
+}
+
+func readGitIndex() ([]IndexEntry, error) {
+	file, err := os.Open(".git/index")
+	if err != nil {
+		return nil, err
+	}
+
+	defer file.Close()
+
+	header := make([]byte, 12)
+	if _, err := io.ReadFull(file, header); err != nil {
+		return nil, err
+	}
+
+	if string(header[:4]) != "DIRC" {
+		return nil, fmt.Errorf("invalid index signature")
+	}
+
+	version := binary.BigEndian.Uint32(header[4:8])
+	if version != 2 {
+		return nil, fmt.Errorf("unsupported index version: %d", version)
+	}
+
+	entryCount := binary.BigEndian.Uint32(header[8:12])
+	entries := make([]IndexEntry, 0, entryCount)
+
+	for i := 0; i < int(entryCount); i++ {
+		entryHeader := make([]byte, 62)
+		if _, err := io.ReadFull(file, entryHeader); err != nil {
+			return nil, fmt.Errorf("reading entry header: %w", err)
+		}
+
+		mode := binary.BigEndian.Uint32(entryHeader[24:28])
+		hash := make([]byte, 20)
+		copy(hash, entryHeader[40:60])
+
+		flags := binary.BigEndian.Uint16(entryHeader[60:62])
+		nameLen := int(flags & 0x0FFF)
+
+		nameBytes := make([]byte, nameLen)
+		if _, err := io.ReadFull(file, nameBytes); err != nil {
+			return nil, fmt.Errorf("reading path: %w", err)
+		}
+
+		totalLen := 62 + nameLen
+		padding := (8 - (totalLen % 8)) % 8
+		if _, err := io.CopyN(io.Discard, file, int64(padding)); err != nil {
+			return nil, fmt.Errorf("discarding padding: %w", err)
+		}
+
+		entry := IndexEntry{
+			Path: string(nameBytes),
+			Hash: hash,
+			Mode: mode,
+		}
+
+		entries = append(entries, entry)
+	}
+
+	return entries, nil
+}
+
+func makeDirTree(indexEntries []IndexEntry) *TreeNode {
+	root := &TreeNode{
+		Children: make(map[string]*TreeNode),
+		Mode:     40000,
+	}
+
+	root.Name = "root"
+	root.IsDir = true
+
+	for _, entry := range indexEntries {
+		insertInTree(root, entry.Path, &entry)
+	}
+
+	return root
+}
+
+func insertInTree(root *TreeNode, path string, entry *IndexEntry) {
+	pathParts := strings.Split(path, "/")
+	nextPath := strings.Join(pathParts[1:], "/")
+
+	if _, ok := root.Children[pathParts[0]]; ok {
+		// If it already exist
+		insertInTree(root.Children[pathParts[0]], nextPath, entry)
+		return
+	}
+	newNode := &TreeNode{
+		Children: make(map[string]*TreeNode),
+		Name:     pathParts[0],
+	}
+	if len(pathParts) == 1 {
+		newNode.Hash = entry.Hash
+		newNode.IsDir = false
+		newNode.Mode = entry.Mode
+		root.Children[pathParts[0]] = newNode
+		return
+	}
+
+	newNode.IsDir = true
+	newNode.Mode = 40000
+	root.Children[pathParts[0]] = newNode
+	insertInTree(root.Children[pathParts[0]], nextPath, entry)
+}
+
+func printTree(root *TreeNode) {
+	if root == nil {
+		return
+	}
+
+	for _, child := range root.Children {
+		printTree(child)
+	}
+	fmt.Printf("Name: %s, hash: %x, mode: %s\n", root.Name, root.Hash)
+}
+
+// DFS
+func createObjects(root *TreeNode) error {
+
+	// If it is a file - can't go deeper
+	if len(root.Children) == 0 {
+		return nil
+	}
+
+	// Create each subdirectory first
+	for _, child := range root.Children {
+		if child.IsDir {
+			if err := createObjects(child); err != nil {
+				return err
+			}
+		}
+	}
+
+	// At this moment, we know that each sub-file/dir is already created
+	hash, err := createTree(root)
+	if err != nil {
+		return err
+	}
+
+	root.Hash = hash
+	return nil
+}
+
+// Creates compressed tree object and return its hash
+func createTree(root *TreeNode) ([]byte, error) {
+	treeContent := createTreeContent(root.Children)
+	treeByteObject := generateObject("tree", len(treeContent), treeContent)
+	hash := hashObject(treeByteObject)
+	compressedTree, err := compressObject(treeByteObject)
+	if err != nil {
+		return nil, err
+	}
+	err = writeObject(hash, compressedTree)
+	if err != nil {
+		return nil, err
+	}
+	return hash, nil
+}
+
+func createTreeContent(children map[string]*TreeNode) []byte {
+	var content []byte
+	var keys []string
+	for name := range children {
+		keys = append(keys, name)
+	}
+	sort.Strings(keys)
+
+	for _, name := range keys {
+		child := children[name]
+
+		var modeStr string
+		if child.IsDir {
+			modeStr = "40000"
+		} else {
+			modeStr = fmt.Sprintf("%06o", child.Mode)
+		}
+
+		entryHeader := fmt.Sprintf("%s %s", modeStr, child.Name)
+		content = append(content, []byte(entryHeader)...)
+		content = append(content, 0)
+
+		content = append(content, child.Hash[:]...)
+
+	}
+
+	return content
 }

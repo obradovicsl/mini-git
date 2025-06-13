@@ -1,12 +1,14 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"compress/zlib"
 	"crypto/sha1"
 	"encoding/binary"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path"
@@ -29,6 +31,12 @@ type TreeNode struct {
 	Hash     []byte
 	Mode     uint32
 	Children map[string]*TreeNode
+}
+
+type GitObject struct {
+	Type string
+	Data []byte
+	Hash string
 }
 
 // Usage: your_program.sh <command> <arg1> <arg2> ...
@@ -180,6 +188,47 @@ func main() {
 		}
 		fmt.Printf("%x\n", hash)
 
+	case "clone":
+		// Get repo_url an dir_name from args
+		remoteUrl, directoryName, err := parseClone(os.Args[2:])
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error while parssing args: %s\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Cloning from %s into %s\n", remoteUrl, directoryName)
+
+		// Send GET req to github
+		hashHead, capabilities, err := fetchRefs(remoteUrl)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error while fetching refs: %v:\n", err)
+			os.Exit(1)
+		}
+
+		// git-upload-pack request
+
+		// make want-have request
+		request := buildUploadPackRequest(hashHead, capabilities)
+
+		fmt.Println(string(request))
+
+		// send request
+		packData, err := sendUploadPackRequest(remoteUrl, request)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error during git-upload-pack request: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Println(string(packData))
+
+		// Parse pack file (extract objects - blob, trees, commits)
+		objects, err := parsePackFile(packData)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error while parsing packfile: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Println(len(objects))
+
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command %s\n", command)
 		os.Exit(1)
@@ -279,6 +328,20 @@ func parseCommitTree(args []string) (string, string, string, error) {
 	}
 
 	return treeSHA, message, parentSHA, nil
+}
+
+func parseClone(args []string) (string, string, error) {
+	if len(args) != 2 {
+		return "", "", fmt.Errorf("use: git clone <URL> <some_dir>")
+	}
+
+	var url string
+	var directory string
+
+	url = args[0]
+	directory = args[1]
+
+	return url, directory, nil
 }
 
 func decompressObject(objectPath string) ([]byte, error) {
@@ -644,4 +707,148 @@ func createCommitContent(treeHash, commitMessage, parentHash string) []byte {
 	content += "\n"
 
 	return []byte(content)
+}
+
+func fetchRefs(remoteUrl string) (string, string, error) {
+	refsUrl := fmt.Sprintf("%s/info/refs?service=git-upload-pack", remoteUrl)
+
+	resp, err := http.Get(refsUrl)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to fetch refs: %v", err)
+	}
+
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return "", "", fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to read response body: %v", err)
+	}
+
+	refs, capabilities, err := parseRefs(body)
+	if err != nil {
+		return "", "", err
+	}
+
+	return refs["HEAD"], capabilities, nil
+}
+
+func parseRefs(body []byte) (map[string]string, string, error) {
+	refs := make(map[string]string)
+	var capabilities string
+
+	scanner := bufio.NewScanner(bytes.NewReader(body))
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) > 4 && string(line[4:]) != "" && !bytes.HasPrefix(line[4:], []byte("#")) {
+			// Split the line by null byte
+
+			parts := bytes.Split(line[4:], []byte{0x00})
+			var caps []byte
+			if len(parts) > 1 {
+				caps = parts[1]
+				capabilities = string(caps)
+			}
+
+			if len(parts) > 0 {
+				chunk2 := parts[0]
+
+				// Check if the string ends with "HEAD", then remove the first 4 characters
+				if len(chunk2) > 4 && bytes.HasSuffix(chunk2, []byte("HEAD")) {
+					chunk2 = chunk2[4:]
+				}
+
+				// Split by space to form the chunk array
+				chunk := bytes.Split(chunk2, []byte(" "))
+				if len(chunk) >= 2 {
+					// Decode chunk[0] and chunk[1] and store them in refs map
+					refs[string(chunk[1])] = string(chunk[0])
+				}
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		fmt.Println("Error scanning response body:", err)
+	}
+
+	return refs, capabilities, nil
+}
+
+func buildUploadPackRequest(hash, capabilities string) []byte {
+	var buf bytes.Buffer
+
+	// First line: "want <hash> <capabilities>\n"
+	wantLine := fmt.Sprintf("want %s %s\n", hash, capabilities)
+	writePktLine(&buf, wantLine)
+
+	buf.WriteString("0000")
+	// Second line - done - we don't want anything more
+	writePktLine(&buf, "done\n")
+
+	buf.WriteString("0000")
+
+	return buf.Bytes()
+}
+
+func writePktLine(w io.Writer, line string) {
+	length := len(line) + 4
+	fmt.Fprintf(w, "%04x%s", length, line)
+}
+
+func sendUploadPackRequest(remoteUrl string, request []byte) ([]byte, error) {
+	url := remoteUrl + "/git-upload-pack"
+
+	client := &http.Client{}
+	req, err := http.NewRequest("POST", url, bytes.NewReader(request))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create POST request: %v", err)
+	}
+
+	// REQUIRED headers for smart HTTP upload-pack request
+	req.Header.Set("Content-Type", "application/x-git-upload-pack-request")
+	req.Header.Set("Accept", "application/x-git-upload-pack-result")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %v", err)
+	}
+
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+
+	packData, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %v", err)
+	}
+
+	return packData, nil
+}
+
+func parsePackFile(data []byte) ([]GitObject, error) {
+	if len(data) < 12 {
+		return nil, fmt.Errorf("packfile too short")
+	}
+
+	// Each git package has to start with PACK
+	if !bytes.Equal(data[0:4], []byte("PACK")) {
+		return nil, fmt.Errorf("invalid packfile header")
+	}
+
+	// Packfile version
+	version := binary.BigEndian.Uint32(data[4:8])
+	if version != 2 && version != 3 {
+		return nil, fmt.Errorf("unsupported packfile version: %d", version)
+	}
+
+	numObjects := binary.BigEndian.Uint32(data[8:12])
+	objects := make([]GitObject, 0, numObjects)
+
+	// PARSE EACH OBJECT
+
+	return objects, nil
 }

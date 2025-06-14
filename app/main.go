@@ -6,6 +6,7 @@ import (
 	"compress/zlib"
 	"crypto/sha1"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,6 +18,51 @@ import (
 	"strconv"
 	"strings"
 	"time"
+)
+
+type ObjectType int
+
+// func (objType ObjectType) String() string {
+// 	switch objType {
+// 	case OBJ_TREE:
+// 		return "tree"
+// 	case OBJ_COMMIT:
+// 		return "commit"
+// 	case OBJ_BLOB:
+// 		return "blob"
+// 	case OBJ_TAG:
+// 		return "tag"
+// 	case OBJ_OFS_DELTA:
+// 		return "ofs_delta"
+// 	case OBJ_REF_DELTA:
+// 		return "ref_delta"
+// 	default:
+// 		return ""
+// 	}
+// }
+
+func ObjectTypeFromString(s string) (ObjectType, error) {
+	switch s {
+	case "tree":
+		return OBJ_TREE, nil
+	case "commit":
+		return OBJ_COMMIT, nil
+	case "blob":
+		return OBJ_BLOB, nil
+	case "tag":
+		return OBJ_TAG, nil
+	default:
+		return 0, fmt.Errorf("unknown ObjectType: " + s)
+	}
+}
+
+const (
+	OBJ_COMMIT    = 1
+	OBJ_TREE      = 2
+	OBJ_BLOB      = 3
+	OBJ_TAG       = 4
+	OBJ_OFS_DELTA = 6
+	OBJ_REF_DELTA = 7
 )
 
 type IndexEntry struct {
@@ -34,9 +80,10 @@ type TreeNode struct {
 }
 
 type GitObject struct {
-	Type string
-	Data []byte
-	Hash string
+	Type        ObjectType
+	Data        []byte
+	BaseObjHash string
+	Size        uint64
 }
 
 // Usage: your_program.sh <command> <arg1> <arg2> ...
@@ -48,19 +95,11 @@ func main() {
 
 	switch command := os.Args[1]; command {
 	case "init":
-		for _, dir := range []string{".git", ".git/objects", ".git/refs"} {
-			if err := os.MkdirAll(dir, 0755); err != nil {
-				fmt.Fprintf(os.Stderr, "Error creating directory: %s\n", err)
-				os.Exit(1)
-			}
-		}
-
-		headFileContents := []byte("ref: refs/heads/main\n")
-		if err := os.WriteFile(".git/HEAD", headFileContents, 0644); err != nil {
-			fmt.Fprintf(os.Stderr, "Error writing file: %s\n", err)
+		err := initRepo()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error with init: %s\n", err)
 			os.Exit(1)
 		}
-
 		fmt.Println("Initialized git directory")
 	case "cat-file":
 		objectPath, flag, err := parseCatFile(os.Args[2:])
@@ -95,15 +134,9 @@ func main() {
 		objectBytes := generateObject("blob", objectSize, objectContent)
 		hash := hashObject(objectBytes)
 
-		compressedObject, err := compressObject(objectBytes)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error while compresing object: %s\n", err)
-			os.Exit(1)
-		}
-
 		switch flag {
 		case "-w":
-			err := writeObject(hash, compressedObject)
+			_, err := writeObject(objectBytes)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error while writting the object: %s\n", err)
 				os.Exit(1)
@@ -167,21 +200,14 @@ func main() {
 	case "commit-tree":
 		treeHash, commitMessage, parentHash, err := parseCommitTree(os.Args[2:])
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error while parssing args: %s\n", err)
+			fmt.Fprintf(os.Stderr, "Error while parsing args: %s\n", err)
 			os.Exit(1)
 		}
 
 		commitContent := createCommitContent(treeHash, commitMessage, parentHash)
 		objectBytes := generateObject("commit", len(commitContent), commitContent)
-		hash := hashObject(objectBytes)
 
-		compressedObject, err := compressObject(objectBytes)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error while compresing commit: %s\n", err)
-			os.Exit(1)
-		}
-
-		err = writeObject(hash, compressedObject)
+		hash, err := writeObject(objectBytes)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error while writting the commit: %s\n", err)
 			os.Exit(1)
@@ -195,6 +221,21 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error while parssing args: %s\n", err)
 			os.Exit(1)
 		}
+		err = os.MkdirAll(directoryName, 0755)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error while creating %s directory: %s\n", directoryName, err)
+			os.Exit(1)
+		}
+		// change to the new directory created to run all the other file creations
+
+		err = os.Chdir(directoryName)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error while changing to %s directory: %s\n", directoryName, err)
+			os.Exit(1)
+		}
+
+		initRepo()
+
 		fmt.Printf("Cloning from %s into %s\n", remoteUrl, directoryName)
 
 		// Send GET req to github
@@ -209,16 +250,12 @@ func main() {
 		// make want-have request
 		request := buildUploadPackRequest(hashHead, capabilities)
 
-		fmt.Println(string(request))
-
 		// send request
 		packData, err := sendUploadPackRequest(remoteUrl, request)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error during git-upload-pack request: %v\n", err)
 			os.Exit(1)
 		}
-
-		fmt.Println(string(packData))
 
 		// Parse pack file (extract objects - blob, trees, commits)
 		objects, err := parsePackFile(packData)
@@ -227,12 +264,25 @@ func main() {
 			os.Exit(1)
 		}
 
-		fmt.Println(len(objects))
+		fmt.Println("Read objects: ", len(objects))
 
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command %s\n", command)
 		os.Exit(1)
 	}
+}
+
+func initRepo() error {
+	for _, dir := range []string{".git", ".git/objects", ".git/refs"} {
+		if err := os.Mkdir(dir, 0755); err != nil {
+			return fmt.Errorf("Error creating directory: %s\n", err)
+		}
+	}
+	headFileContents := []byte("ref: refs/heads/master\n")
+	if err := os.WriteFile(".git/HEAD", headFileContents, 0644); err != nil {
+		fmt.Errorf("Error writing file: %s\n", err)
+	}
+	return nil
 }
 
 func parseCatFile(args []string) (string, string, error) {
@@ -474,7 +524,16 @@ func generateObject(objectType string, objectSize int, objectContent []byte) []b
 	return append(headerNull, objectContent...)
 }
 
-func writeObject(hash, object []byte) error {
+// Takes in raw objet bytes, creates hash using SHA1, compress and write the object
+func writeObject(object []byte) ([]byte, error) {
+
+	hash := hashObject(object)
+	compressedObject, err := compressObject(object)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error while compresing commit: %s\n", err)
+		os.Exit(1)
+	}
+
 	hashString := fmt.Sprintf("%x", hash)
 
 	dirName := hashString[:2]
@@ -482,22 +541,22 @@ func writeObject(hash, object []byte) error {
 
 	dirPath := path.Join(".git/objects", dirName)
 	if err := os.MkdirAll(dirPath, 0755); err != nil {
-		return fmt.Errorf("failed to create directory: %v", err)
+		return nil, fmt.Errorf("failed to create directory: %v", err)
 	}
 
 	fullPath := path.Join(dirPath, fileName)
 
 	if _, err := os.Stat(fullPath); err == nil {
-		return nil
+		return hash, nil
 	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("error checking object file: %v", err)
+		return nil, fmt.Errorf("error checking object file: %v", err)
 	}
 
-	if err := os.WriteFile(fullPath, object, 0644); err != nil {
-		return fmt.Errorf("failed to write object file: %v", err)
+	if err := os.WriteFile(fullPath, compressedObject, 0644); err != nil {
+		return nil, fmt.Errorf("failed to write object file: %v", err)
 	}
 
-	return nil
+	return hash, nil
 }
 
 func readGitIndex() ([]IndexEntry, error) {
@@ -646,12 +705,7 @@ func createObjects(root *TreeNode) error {
 func createTree(root *TreeNode) ([]byte, error) {
 	treeContent := createTreeContent(root.Children)
 	treeByteObject := generateObject("tree", len(treeContent), treeContent)
-	hash := hashObject(treeByteObject)
-	compressedTree, err := compressObject(treeByteObject)
-	if err != nil {
-		return nil, err
-	}
-	err = writeObject(hash, compressedTree)
+	hash, err := writeObject(treeByteObject)
 	if err != nil {
 		return nil, err
 	}
@@ -830,25 +884,156 @@ func sendUploadPackRequest(remoteUrl string, request []byte) ([]byte, error) {
 }
 
 func parsePackFile(data []byte) ([]GitObject, error) {
-	if len(data) < 12 {
-		return nil, fmt.Errorf("packfile too short")
-	}
 
-	// Each git package has to start with PACK
-	if !bytes.Equal(data[0:4], []byte("PACK")) {
-		return nil, fmt.Errorf("invalid packfile header")
-	}
+	// end of .pack file a check sum (last 20 bytes) - we don't need that now
+	data = data[:len(data)-20]
 
-	// Packfile version
-	version := binary.BigEndian.Uint32(data[4:8])
-	if version != 2 && version != 3 {
-		return nil, fmt.Errorf("unsupported packfile version: %d", version)
-	}
+	offset := bytes.Index(data, []byte("PACK")) + 4
+	version := binary.BigEndian.Uint32(data[offset : offset+4])
+	offset += 4
+	numObjects := binary.BigEndian.Uint32(data[offset : offset+4])
+	offset += 4
 
-	numObjects := binary.BigEndian.Uint32(data[8:12])
 	objects := make([]GitObject, 0, numObjects)
 
-	// PARSE EACH OBJECT
+	fmt.Printf("Version: %d, %d objects\n", version, numObjects)
+
+	for i := 0; i < int(numObjects); i++ {
+
+		_, used, objType, err := parseObjectHeader(data[offset:])
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse object header: %v", err)
+		}
+		offset += used
+		var baseObjHash string
+		if objType == OBJ_REF_DELTA {
+			baseObjHash = hex.EncodeToString(data[offset : offset+20])
+			offset += 20
+		} else if objType == OBJ_OFS_DELTA {
+			_, ofsLen := parseDeltaOffset(data[offset:])
+			offset += ofsLen
+		}
+
+		zlibStart := offset
+		decompressed, used, err := readZlibObject(data[zlibStart:])
+		if err != nil {
+			return nil, fmt.Errorf("failed to read obj delta content at %d: %w", zlibStart, err)
+		}
+		offset += used
+
+		objects = append(objects, GitObject{
+			Type:        objType,
+			BaseObjHash: baseObjHash,
+			Data:        decompressed,
+		})
+	}
 
 	return objects, nil
+}
+
+func parseObjectHeader(data []byte) (uint64, int, ObjectType, error) {
+	used := 0
+	// Header is usually the first byte
+	byteData := data[used]
+	used++
+
+	// Object type is always (6-4 bits)
+	objectType := ObjectType((byteData >> 4) & 0x7)
+	size := uint64(byteData & 0xF)
+	shift := 4
+	// If MSB == 1, we have to look the next byte
+	for byteData&0x80 != 0 {
+		// MSB == 1
+		if len(data) <= used || 64 <= shift {
+			return 0, 0, 0, fmt.Errorf("bad object header")
+		}
+		byteData = data[used]
+		used++
+		size += uint64(byteData&0x7F) << shift
+		shift += 7
+	}
+
+	return size, used, objectType, nil
+
+}
+
+func readZlibObject(pack []byte) ([]byte, int, error) {
+	reader := bytes.NewReader(pack)
+	r, err := zlib.NewReader(reader)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer r.Close()
+
+	decompData, err := io.ReadAll(r)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	used := int(reader.Size()) - reader.Len()
+
+	return decompData, used, nil
+}
+
+func writeObjectWithType(content []byte, objectType ObjectType) []byte {
+	object := bytes.Buffer{}
+	fmt.Fprintf(&object, "%s %d", objectType, len(content))
+	object.WriteByte(0)
+	object.Write(content)
+	// Write to disk
+	hash, _ := writeObject(object.Bytes())
+	return hash
+}
+
+func parseDeltaSize(packFile []byte) (int, int) {
+	size := packFile[0] & 0b01111111
+	index, off := 1, 7
+
+	for packFile[index-1]&0b10000000 > 0 { // Check if MSB is set
+		size = size | (packFile[index]&0b01111111)<<off
+		off += 7
+		index += 1
+	}
+
+	// this index is the same as the used bytes
+
+	return int(size), index
+}
+
+func parseDeltaOffset(data []byte) (val uint64, used int) {
+    b := data[0]
+    val = uint64(b & 0x7F)
+    used = 1
+    for b&0x80 != 0 {
+        b = data[used]
+        val = (val + 1) << 7 | uint64(b&0x7F)
+        used++
+    }
+    return
+}
+
+
+func readObjectFromHash(hashString string) (string, []byte) {
+	// read file
+	f, err := os.Open(fmt.Sprintf(".git/objects/%s/%s", hashString[:2], hashString[2:]))
+
+	if err != nil {
+		fmt.Println("Error could not open file", err)
+	}
+
+	defer f.Close()
+
+	r, err := zlib.NewReader(f)
+
+	obj, _ := io.ReadAll(r)
+
+	if err != nil {
+		fmt.Println("could not decompress the object")
+	}
+	// get only the content
+	header, body, _ := bytes.Cut(obj, []byte{0x00})
+
+	objType := strings.Split(string(header), " ")
+
+	return objType[0], body
 }

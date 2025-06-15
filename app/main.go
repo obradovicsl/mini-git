@@ -274,6 +274,14 @@ func main() {
 
 		fmt.Printf("Successfully wrote %d objects:\n ", len(objects))
 
+		err = renderFiles(hashHead)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error while rendering object files: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Printf("Successfully cloned repository:\n ")
+
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command %s\n", command)
 		os.Exit(1)
@@ -1004,7 +1012,7 @@ func writePackObjects(objects []GitObject) error {
 			if err != nil {
 				return fmt.Errorf("failed to write %s object: %v", string(obj.Type), err)
 			}
-			
+
 		} else if obj.Type == OBJ_REF_DELTA {
 			err := writeRefDeltaObject(obj)
 			if err != nil {
@@ -1102,4 +1110,83 @@ func applyDelta(base, delta []byte) ([]byte, error) {
 		}
 	}
 	return result, nil
+}
+
+func renderFiles(branchHash string) error {
+	_, _, commit, err := readObjectFromHash(branchHash)
+	if err != nil {
+		return fmt.Errorf("failed to read HEAD commit (%s): %v", branchHash, err)
+	}
+
+	lines := strings.Split(string(commit), "\n")
+	var treeHash string
+
+	for _, line := range lines {
+		if strings.HasPrefix(line, "tree") {
+			treeHash = strings.TrimPrefix(line, "tree ")
+			break
+		}
+	}
+
+	if treeHash == "" {
+		return fmt.Errorf("tree hash not found in commit")
+	}
+
+	return renderTreeRecursive(treeHash, ".")
+}
+
+func renderTreeRecursive(treeHash, currentPath string) error {
+	objType, _, content, err := readObjectFromHash(treeHash)
+	if err != nil {
+		return fmt.Errorf("cannot read tree %s: %v", treeHash, err)
+	}
+	if objType != "tree" {
+		return fmt.Errorf("object %s is not a tree", treeHash)
+	}
+
+	// content of a directory (files/dirs)
+	data := content
+	i := 0
+	for i < len(data) {
+		// Read mode
+		modeEnd := bytes.IndexByte(data[i:], ' ')
+		mode := string(data[i : i+modeEnd])
+		i += modeEnd + 1
+
+		// Read name
+		nameEnd := bytes.IndexByte(data[i:], 0)
+		name := string(data[i : i+nameEnd])
+		i += nameEnd + 1
+
+		// Read SHA (20 bytes)
+		shaBytes := data[i : i+20]
+		objHash := hex.EncodeToString(shaBytes)
+		i += 20
+
+		fullPath := filepath.Join(currentPath, name)
+
+		if mode == "40000" {
+			// directory
+			if err := os.MkdirAll(fullPath, 0755); err != nil {
+				return err
+			}
+			if err := renderTreeRecursive(objHash, fullPath); err != nil {
+				return err
+			}
+		} else {
+			// blob (file)
+			typ, _, blobContent, err := readObjectFromHash(objHash)
+			if err != nil {
+				return err
+			}
+			if typ != "blob" {
+				return fmt.Errorf("expected blob, got %s", typ)
+			}
+			if err := os.WriteFile(fullPath, blobContent, 0644); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
 }

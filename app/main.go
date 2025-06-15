@@ -264,7 +264,7 @@ func main() {
 			os.Exit(1)
 		}
 
-		fmt.Printf("Successfully read %d objects:\n ", len(objects))
+		// fmt.Printf("Successfully read %d objects:\n ", len(objects))
 		// Write objects to .git/objects
 		err = writePackObjects(objects)
 		if err != nil {
@@ -272,7 +272,7 @@ func main() {
 			os.Exit(1)
 		}
 
-		fmt.Printf("Successfully wrote %d objects:\n ", len(objects))
+		// fmt.Printf("Successfully wrote %d objects:\n ", len(objects))
 
 		err = renderFiles(hashHead)
 		if err != nil {
@@ -280,7 +280,7 @@ func main() {
 			os.Exit(1)
 		}
 
-		fmt.Printf("Successfully cloned repository:\n ")
+		// fmt.Printf("Successfully cloned repository:\n ")
 
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command %s\n", command)
@@ -881,14 +881,12 @@ func parsePackFile(data []byte) ([]GitObject, error) {
 	data = data[:len(data)-20]
 
 	offset := bytes.Index(data, []byte("PACK")) + 4
-	version := binary.BigEndian.Uint32(data[offset : offset+4])
+	_ = binary.BigEndian.Uint32(data[offset : offset+4])
 	offset += 4
 	numObjects := binary.BigEndian.Uint32(data[offset : offset+4])
 	offset += 4
 
 	objects := make([]GitObject, 0, numObjects)
-
-	fmt.Printf("Version: %d, %d objects\n", version, numObjects)
 
 	for i := 0; i < int(numObjects); i++ {
 

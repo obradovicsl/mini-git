@@ -264,7 +264,7 @@ func main() {
 			os.Exit(1)
 		}
 
-		// fmt.Printf("Successfully read %d objects:\n ", len(objects))
+		fmt.Printf("Successfully read %d objects:\n ", len(objects))
 		// Write objects to .git/objects
 		err = writePackObjects(objects)
 		if err != nil {
@@ -272,7 +272,7 @@ func main() {
 			os.Exit(1)
 		}
 
-		// fmt.Printf("Successfully wrote %d objects:\n ", len(objects))
+		fmt.Printf("Successfully wrote %d objects:\n ", len(objects))
 
 		err = renderFiles(hashHead)
 		if err != nil {
@@ -280,7 +280,7 @@ func main() {
 			os.Exit(1)
 		}
 
-		// fmt.Printf("Successfully cloned repository:\n ")
+		fmt.Printf("Successfully cloned repository:\n ")
 
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown command %s\n", command)
@@ -296,9 +296,34 @@ func initRepo() error {
 	}
 	headFileContents := []byte("ref: refs/heads/master\n")
 	if err := os.WriteFile(".git/HEAD", headFileContents, 0644); err != nil {
-		fmt.Errorf("Error writing file: %s\n", err)
+		return fmt.Errorf("Error writing file: %s\n", err)
+	}
+
+	err := createEmptyIndex()
+	if err != nil {
+		return fmt.Errorf("Error creating .git/index: %v\n", err)
 	}
 	return nil
+}
+
+func createEmptyIndex() error {
+	// Index v2 header:
+	// 4 bytes: signature ("DIRC")
+	// 4 bytes: version (2)
+	// 4 bytes: entry count (0)
+	header := make([]byte, 12)
+	copy(header[0:4], []byte("DIRC"))
+	binary.BigEndian.PutUint32(header[4:8], 2)  // version 2
+	binary.BigEndian.PutUint32(header[8:12], 0) // 0 entries
+
+	// SHA1 checksum of the content (excluding checksum itself)
+	hash := sha1.Sum(header)
+
+	// Append checksum to end
+	full := append(header, hash[:]...)
+
+	// Write to .git/index
+	return os.WriteFile(".git/index", full, 0644)
 }
 
 /////////////////////////COMMAND PARSER////////////////////////////////////////////////////////////////////
@@ -881,12 +906,14 @@ func parsePackFile(data []byte) ([]GitObject, error) {
 	data = data[:len(data)-20]
 
 	offset := bytes.Index(data, []byte("PACK")) + 4
-	_ = binary.BigEndian.Uint32(data[offset : offset+4])
+	version := binary.BigEndian.Uint32(data[offset : offset+4])
 	offset += 4
 	numObjects := binary.BigEndian.Uint32(data[offset : offset+4])
 	offset += 4
 
 	objects := make([]GitObject, 0, numObjects)
+
+	fmt.Printf("Version: %d, %d objects\n", version, numObjects)
 
 	for i := 0; i < int(numObjects); i++ {
 

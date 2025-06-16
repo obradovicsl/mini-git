@@ -21,7 +21,7 @@ Implements `git init` to create a `.git` directory
 * `index` - file that contains the staging area (place where all changes goes after `git add` command)
 * `HEAD` – file that references the current branch (`ref: refs/heads/main\n`)
 
-Original version of `.git` directory contains a little more files: 
+Original version of `.git` directory also contains: 
 
 * `hooks/` – lifecycle scripts (code that can be run after certain events)
 * `config` – repo configuration (txt file with repo config - author, file mode...)

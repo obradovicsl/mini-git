@@ -341,6 +341,10 @@ The pack file contains all objects (commits, trees, blobs, deltas) in a compress
      * Size of uncompressed object (bits 3-0 + bits 6-0 from next byte if MSB==1)
      * Bit 7: MSB flag (if 1, continue reading size from next byte)
 
+### **Note**
+ - Git uses Big-Endian (network byte order) in the pack file, whereas most modern CPUs use Little-Endian. Special care must be taken when interpreting binary data to avoid misreading multi-byte integers. [Read more about Endianness](https://en.wikipedia.org/wiki/Endianness)
+
+
 ### Steps
 
 
@@ -414,13 +418,6 @@ Now that we have all the objects locally, we can rebuild the full working direct
   * If it's a **subtree**, create the directory and recurse into it
 
 This is best done using **DFS (depth-first search)** to ensure we fully populate nested directories before moving up.
-
-
-
-
-### Endianness
-
-Git uses **Big-Endian (network byte order)** in the pack file, whereas most modern CPUs use **Little-Endian**. Special care must be taken when interpreting binary data to avoid misreading multi-byte integers.
 
 
 ### Conclusion
